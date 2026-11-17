@@ -6,6 +6,8 @@
 #include <ncurses.h>
 #include <pthread.h>
 
+#include "effects_list.h"
+
 #define BLOCK_FRAMES 256
 #define INT16MAXVAL 32767.0
 
@@ -15,16 +17,11 @@
 					return err;\
 				}
 
-typedef struct {
-	void (*effect)(float*, size_t);
-	char *name;
-	char **paramname;
-	float *param;
-	int paramsize;
-	int on;
-} effect_t;
 
-effect_t effects[2];
+
+//effect_t effects[16];
+
+char effects[16][32];
 
 int effects_cnt = 0;
 
@@ -46,6 +43,10 @@ float ebuffer[BLOCK_FRAMES];
 
 int exit_val = 0;
 
+effects_list_t *effects_list;
+
+pthread_mutex_t chain_mtx;
+
 void *graph(void *arg) {
 	initscr();
 	noecho();
@@ -55,6 +56,7 @@ void *graph(void *arg) {
 	int oldcol = 0;
 	int selrow = 0;
 	int changes = 0;
+	int mode = 0; // 0 for main mode, 1 for effect selection
 	while (!exit_val) {
 		int row;
 		int col;
@@ -67,15 +69,26 @@ void *graph(void *arg) {
 		}
 		if (changes) {
 			clear();
-			for (int i = 0; i < effects_cnt; ++i) {
-				move(currow++, 0);
-				printw("%s %s", effects[i].name, (effects[i].on ? "ON" : "OFF"));
-				for (int j = 0; j < effects[i].paramsize; ++j) {
-					move(currow++, 4);
-					printw("%s\t%f", effects[i].paramname[j], effects[i].param[j]);
-				}
+			switch (mode) {
+				case 0:
+					for (effects_list_t *cureff = effects_list; cureff != NULL; cureff = cureff->next) {
+						move(currow++, 0);
+						printw("%s %s", cureff->effect->name, (cureff->effect->on ? "ON" : "OFF"));
+						for (int j = 0; j < cureff->effect->paramsize; ++j) {
+							move(currow++, 4);
+							printw("%s\t%f", cureff->effect->paramname[j], cureff->effect->param[j]);
+						}
+					}
+					mvchgat(selrow, 0, col, A_REVERSE, 0, NULL);
+					break;
+				case 1:
+					for (int i = 0; i < effects_cnt; ++i) {
+						move(currow++, 0);
+						printw("%s", effects[i]);
+					}
+					mvchgat(selrow, 0, col, A_REVERSE, 0, NULL);
+					break;
 			}
-			mvchgat(selrow, 0, col, A_REVERSE, 0, NULL);
 			refresh();
 			changes = 0;
 		}
@@ -83,7 +96,12 @@ void *graph(void *arg) {
 		if (ch != ERR) {
 			switch (ch) {
 				case 'q':
-					exit_val = 1;
+					if (mode == 0) {
+						exit_val = 1;
+						break;
+					}
+					mode = 0;
+					changes = 1;
 					break;
 				case KEY_UP:
 					if (selrow > 0) {
@@ -98,14 +116,18 @@ void *graph(void *arg) {
 					changes = 1;
 					break;
 				case KEY_LEFT: {
+					if (mode != 0) break;
 					int rval = 0;
 					int found = 0;
-					for (int i = 0; (i < effects_cnt) && !found; ++i) {
+					for (effects_list_t *cureff = effects_list; cureff != NULL; cureff = cureff->next) {
 						if (rval == selrow) found = 1;
 						rval++;
-						for (int j = 0; (j < effects[i].paramsize) && !found; ++j) {
+						for (int j = 0; j < cureff->effect->paramsize; ++j) {
 							if (rval == selrow) {
-								effects[i].param[j] -= 0.01;
+								cureff->effect->param[j] -= cureff->effect->paramdelta[j];
+								if (cureff->effect->param[j] < cureff->effect->minparamval[j]) {
+									cureff->effect->param[j] = cureff->effect->minparamval[j];
+								}
 								changes = 1;
 								found = 1;
 							}
@@ -115,16 +137,20 @@ void *graph(void *arg) {
 					}
 					break;
 				case KEY_RIGHT: {
+					if (mode != 0) break;
 					int rval = 0;
 					int found = 0;
-					for (int i = 0; !found && (i < effects_cnt); ++i) {
+					for (effects_list_t *cureff = effects_list; cureff != NULL; cureff = cureff->next) {
 						if (rval == selrow) found = 1;
 						rval++;
-						for (int j = 0; !found && (j < effects[i].paramsize); ++j) {
+						for (int j = 0; j < cureff->effect->paramsize; ++j) {
 							if (rval == selrow) {
-							       effects[i].param[j] += 0.01;
-							       changes = 1;
-							       found = 1;
+								cureff->effect->param[j] += cureff->effect->paramdelta[j];
+								if (cureff->effect->param[j] > cureff->effect->maxparamval[j]) {
+									cureff->effect->param[j] = cureff->effect->maxparamval[j];
+								}
+								changes = 1;
+								found = 1;
 							}
 							rval++;
 						}
@@ -132,20 +158,39 @@ void *graph(void *arg) {
 					}
 					break;
 				case ' ':
+					if (mode == 1) {
+						pthread_mutex_lock(&chain_mtx);
+						pushEffect(&effects_list, effects[selrow]);
+						pthread_mutex_unlock(&chain_mtx);
+						mode = 0;
+						changes = 1;
+						break;
+					}
 					int rval = 0;
 					int found = 0;
-					for (int i = 0; !found && (i < effects_cnt); ++i) {
+					for (effects_list_t *cureff = effects_list; cureff != NULL; cureff = cureff->next) {
 						if (rval == selrow) {
-							effects[i].on ^= 1;
+							cureff->effect->on ^= 1;
 							changes = 1;
 							found = 1;
 						}
 						rval++;
-						for (int j = 0; !found && (j < effects[i].paramsize); ++j) {
+						for (int j = 0; j < cureff->effect->paramsize; ++j) {
 							if (rval == selrow) found = 1;
 							rval++;
 						}
 					}
+					break;
+				case '+':
+					if (mode == 1) break;
+					mode = 1;
+					changes = 1;
+					break;
+				case '-':
+					pthread_mutex_lock(&chain_mtx);
+					pullEffect(&effects_list);
+					pthread_mutex_unlock(&chain_mtx);
+					changes = 1;
 					break;
 			}
 		}
@@ -206,23 +251,38 @@ int main(int argc, char **argv) {
 		printf("%s\n", entry->d_name);
 		char efpath[32];
 		snprintf(efpath, 32, "./effects/%s", entry->d_name);
-		void *handle = dlopen(efpath, RTLD_LAZY);
+		size_t len = strlen(efpath);
+		if (len > 3 && efpath[len-1] == 'o' && efpath[len-2] == 's' && efpath[len-3] == '.') {
+			memcpy(effects[cureff], efpath, 32);
+			cureff++;
+		}
+/*		void *handle = dlopen(efpath, RTLD_LAZY);
 		if (!handle) {
 			continue;
 		}
 		printf("Found %s\n", efpath);
 		dlerror();
 
-		void (*init)(void) = (void*)dlsym(handle, "init");
+		effects[cureff].init = (void*)dlsym(handle, "init");
 		char *error = dlerror();
-		if (!error) {
-			init();
+		if (error) {
+			fprintf(stderr, "Error getting effect init: %s\n", error);
+			dlclose(handle);
+			continue;
 		}
 
 		effects[cureff].effect = (void*)dlsym(handle, "effect");
 		error = dlerror();
 		if (error) {
 			fprintf(stderr, "Error getting effect: %s\n", error);
+			dlclose(handle);
+			continue;
+		}
+
+		effects[cureff].destroy = (void*)dlsym(handle, "destroy");
+		error = dlerror();
+		if (error) {
+			fprintf(stderr, "Error getting effect destructor: %s\n", error);
 			dlclose(handle);
 			continue;
 		}
@@ -251,6 +311,30 @@ int main(int argc, char **argv) {
 			continue;
 		}
 
+		effects[cureff].maxparamval = *((float**)dlsym(handle, "maxparamval"));
+		error = dlerror();
+		if (error) {
+			fprintf(stderr, "Error getting effect parameters: %s\n", error);
+			dlclose(handle);
+			continue;
+		}
+
+		effects[cureff].minparamval = *((float**)dlsym(handle, "minparamval"));
+		error = dlerror();
+		if (error) {
+			fprintf(stderr, "Error getting effect parameters: %s\n", error);
+			dlclose(handle);
+			continue;
+		}
+
+		effects[cureff].paramdelta = *((float**)dlsym(handle, "paramdelta"));
+		error = dlerror();
+		if (error) {
+			fprintf(stderr, "Error getting effect parameters: %s\n", error);
+			dlclose(handle);
+			continue;
+		}
+
 		effects[cureff].paramsize = *((int*)dlsym(handle, "paramsize"));
 		error = dlerror();
 		if (error) {
@@ -260,7 +344,7 @@ int main(int argc, char **argv) {
 		}
 		
 		effects[cureff].on = 0;
-		cureff++;
+		*/
 	}
 	effects_cnt = cureff;
 
@@ -299,6 +383,10 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Playback open error: %s\n", snd_strerror(err));
 		return 0;
 	}
+	
+	effects_list = NULL;
+
+	pthread_mutex_init(&chain_mtx, NULL);
 
 	pthread_t graph_thread;
 	pthread_create(&graph_thread, NULL, graph, NULL);
@@ -308,15 +396,19 @@ int main(int argc, char **argv) {
 		if (ifs == -EPIPE) snd_pcm_prepare(ihandle);
 		else if (ifs < 0) fprintf(stderr, "Read error: %s\n", snd_strerror(err));
 		i_to_e_buffer();
-		for (int i = 0; i < effects_cnt; ++i) {
-			if (effects[i].on) effects[i].effect(ebuffer, BLOCK_FRAMES);
+		pthread_mutex_lock(&chain_mtx);
+		for (effects_list_t *effect = effects_list; effect != NULL; effect = effect->next) {
+			if (effect->effect->on) effect->effect->effect(ebuffer, BLOCK_FRAMES);
 		}
+		pthread_mutex_unlock(&chain_mtx);
 		e_to_o_buffer();
 		snd_pcm_sframes_t ofs = snd_pcm_writei(ohandle, obuffer, ifs > 0 ? ifs : 0);
 		if (ofs == -EPIPE) snd_pcm_prepare(ohandle);
 		else if(ofs < 0) fprintf(stderr, "Write error: %s\n", snd_strerror(err));
 	}
-
+	
+	freeEffects(&effects_list);
+	pthread_mutex_destroy(&chain_mtx);
 	snd_pcm_close(ohandle);
 	snd_pcm_close(ihandle);
 	return 0;
